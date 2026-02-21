@@ -1,21 +1,25 @@
-# Use a lightweight Python setup
-FROM python:3.9
+# Use a newer, reliable Python version
+FROM python:3.11
 
-# Install the video processing tool (FFmpeg)
+# Install FFmpeg (Video tools)
 RUN apt-get update && \
     apt-get install -y ffmpeg && \
     rm -rf /var/lib/apt/lists/*
 
-# Set up the folder
+# Set up folder
 WORKDIR /app
 
-# Install the python libraries
+# Copy requirements first
 COPY requirements.txt .
+
+# CRITICAL FIX: Upgrade pip (the installer) first
+RUN pip install --upgrade pip
+
+# Install libraries
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your bot code
+# Copy the rest of the code
 COPY . .
 
 # Start the bot
-
 CMD ["python", "bot.py"]
