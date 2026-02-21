@@ -1,5 +1,5 @@
 # Use a lightweight Python setup
-FROM python:3.9-slim
+FROM python:3.9
 
 # Install the video processing tool (FFmpeg)
 RUN apt-get update && \
@@ -17,4 +17,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Start the bot
+
 CMD ["python", "bot.py"]
