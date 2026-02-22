@@ -1,7 +1,7 @@
 import os
-import uuid
 import logging
 import subprocess
+import uuid  # <--- Add this new import!
 from threading import Thread
 from flask import Flask
 from telegram import Update, InputSticker
@@ -27,7 +27,7 @@ def run_http_server():
 # --- SMART VIDEO PROCESSING ---
 async def convert_to_webm(input_path, output_path):
     try:
-        # 1. Get dimensions
+        # 1. Get dimensions and duration
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "v:0", 
              "-show_entries", "stream=width,height,duration", "-of", "csv=s=x:p=0", input_path],
@@ -82,7 +82,7 @@ async def convert_to_webm(input_path, output_path):
         print(f"FFmpeg Error: {e}")
         return False
 
-# --- AUTOMATIC PACK MANAGEMENT (FIXED) ---
+# --- AUTOMATIC PACK MANAGEMENT ---
 async def add_to_pack(user_id, sticker_path, emoji, context):
     bot = context.bot
     bot_name = context.bot.username
@@ -90,17 +90,16 @@ async def add_to_pack(user_id, sticker_path, emoji, context):
     pack_title = f"Video Stickers {user_id}"
 
     with open(sticker_path, 'rb') as f:
-        sticker_data = f.read()
+        sticker_file = f.read()
 
     try:
         # Try adding to existing pack
         await bot.add_sticker_to_set(
             user_id=user_id,
             name=pack_name,
-            sticker=InputSticker(sticker=sticker_data, emoji_list=[emoji])
+            sticker=InputSticker(sticker=sticker_file, format="video", emoji_list=[emoji])
         )
         return f"✅ Added to pack! (Emoji: {emoji})\n🔗 t.me/addstickers/{pack_name}"
-
     except TelegramError as e:
         if "Stickerset_invalid" in str(e):
             # Create new pack if it doesn't exist
@@ -109,8 +108,8 @@ async def add_to_pack(user_id, sticker_path, emoji, context):
                     user_id=user_id,
                     name=pack_name,
                     title=pack_title,
-                    stickers=[InputSticker(sticker=sticker_data, emoji_list=[emoji])],
-                    sticker_format="video"  # <--- This is the correct place for it in v21
+                    stickers=[InputSticker(sticker=sticker_file, format="video", emoji_list=[emoji])],
+                    sticker_format="video"
                 )
                 return f"🎉 New pack created!\n🔗 t.me/addstickers/{pack_name}"
             except Exception as x:
@@ -124,9 +123,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.message
     
-    # Get Emoji
+    # 1. Get the Emoji from caption (or default to 🎬)
+    # If user types "😂" as caption, we use that. If empty, we use "🎬"
     user_emoji = msg.caption if msg.caption else "🎬"
 
+    # Identify file
     file_id = None
     if msg.animation: file_id = msg.animation.file_id
     elif msg.video: file_id = msg.video.file_id
@@ -140,16 +141,16 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         new_file = await context.bot.get_file(file_id)
-        
-        # Unique Filename
-        unique_id = str(uuid.uuid4())
-        input_f = f"{TEMP_FOLDER}/{unique_id}_in"
-        output_f = f"{TEMP_FOLDER}/{unique_id}_sticker.webm"
+        input_f = f"{TEMP_FOLDER}/{user.id}_in"
+        output_f = f"{TEMP_FOLDER}/{user.id}_sticker.webm"
         
         await new_file.download_to_drive(input_f)
 
+        # 2. Convert (Smart Resize)
         if await convert_to_webm(input_f, output_f):
-            await status.edit_text(f"✨ Adding to pack...")
+            await status.edit_text(f"✨ Adding to pack with emoji {user_emoji}...")
+            
+            # 3. Add to Pack (Automatic!)
             result = await add_to_pack(user.id, output_f, user_emoji, context)
             await status.edit_text(result)
         else:
