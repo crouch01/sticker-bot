@@ -1,7 +1,6 @@
 import os
 import logging
 import subprocess
-import uuid  # <--- Add this new import!
 from threading import Thread
 from flask import Flask
 from telegram import Update, InputSticker
@@ -24,7 +23,7 @@ def run_http_server():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- SMART VIDEO PROCESSING ---
+# --- VIDEO PROCESSING ---
 async def convert_to_webm(input_path, output_path):
     try:
         # 1. Get dimensions and duration
@@ -33,6 +32,8 @@ async def convert_to_webm(input_path, output_path):
              "-show_entries", "stream=width,height,duration", "-of", "csv=s=x:p=0", input_path],
             capture_output=True, text=True
         )
+        # Parse probe results (width, height, duration)
+        # Note: sometimes duration is missing or N/A, so we default to 3s if unknown
         parts = probe.stdout.strip().split('x')
         w, h = int(parts[0]), int(parts[1])
         try:
@@ -40,94 +41,106 @@ async def convert_to_webm(input_path, output_path):
         except (IndexError, ValueError):
             duration = 3.0
 
-        # Scale logic
+        # Scale logic: One side 512, other side <= 512
         scale = "scale=512:-1" if w >= h else "scale=-1:512"
 
-        # 2. First Pass: Try High Quality
+        # 2. First Pass: Try High Quality (CRF 30)
+        # We use a temporary file for the first attempt
         temp_output = output_path + ".temp.webm"
+        
         cmd_hq = [
             "ffmpeg", "-y", "-i", input_path,
             "-c:v", "libvpx-vp9", "-an",
             "-vf", f"{scale},fps=30",
-            "-t", "00:00:02.900",
-            "-b:v", "0", "-crf", "30",
+            "-t", "00:00:02.900", # Hard cap at 2.9s
+            "-b:v", "0", "-crf", "30", # Constant Quality
             temp_output
         ]
         subprocess.run(cmd_hq, check=True)
 
-        # 3. Check Size
+        # 3. Check File Size
         file_size_kb = os.path.getsize(temp_output) / 1024
 
         if file_size_kb <= 256:
-            if os.path.exists(output_path): os.remove(output_path)
+            # It fits! Rename temp to actual output
             os.rename(temp_output, output_path)
             return True
         else:
-            # 4. Resize if too big
-            target_bitrate = int((250 * 8192) / duration)
+            # 4. It's too big! Calculate target bitrate to force fit.
+            # Target size: 250KB (leave safety margin)
+            # Formula: (Target KB * 8192) / duration_seconds = Bitrate in bits/sec
+            target_total_bits = 250 * 8192
+            target_bitrate = int(target_total_bits / duration)
+            
+            print(f"File too big ({file_size_kb:.2f}KB). Compressing with bitrate: {target_bitrate}...")
+
             cmd_compress = [
                 "ffmpeg", "-y", "-i", input_path,
                 "-c:v", "libvpx-vp9", "-an",
                 "-vf", f"{scale},fps=30",
                 "-t", "00:00:02.900",
-                "-b:v", str(target_bitrate),
+                "-b:v", str(target_bitrate), # Force calculated bitrate
                 "-minrate", str(int(target_bitrate * 0.7)),
                 "-maxrate", str(int(target_bitrate * 1.3)),
                 output_path
             ]
             subprocess.run(cmd_compress, check=True)
-            if os.path.exists(temp_output): os.remove(temp_output)
+            
+            # Clean up temp file
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
             return True
+
     except Exception as e:
         print(f"FFmpeg Error: {e}")
         return False
 
-# --- AUTOMATIC PACK MANAGEMENT ---
-async def add_to_pack(user_id, sticker_path, emoji, context):
+# --- STICKER PACK MANAGEMENT ---
+async def add_to_pack(user_id, sticker_file_path, context):
     bot = context.bot
     bot_name = context.bot.username
+    
+    # Pack name must be unique and end with _by_BotUsername
     pack_name = f"videopack_{user_id}_by_{bot_name}"
     pack_title = f"Video Stickers {user_id}"
-
-    with open(sticker_path, 'rb') as f:
+    
+    # We need to open the file to upload it
+    with open(sticker_file_path, 'rb') as f:
         sticker_file = f.read()
 
     try:
-        # Try adding to existing pack
+        # 1. Try to add to existing pack
+        # standard emoji is 💿 for video stickers usually
         await bot.add_sticker_to_set(
             user_id=user_id,
             name=pack_name,
-            sticker=InputSticker(sticker=sticker_file, format="video", emoji_list=[emoji])
+            sticker=InputSticker(sticker=sticker_file, format="video", emoji_list=["💿"])
         )
-        return f"✅ Added to pack! (Emoji: {emoji})\n🔗 t.me/addstickers/{pack_name}"
+        return f"✅ Added to your pack!\n\n🔗 t.me/addstickers/{pack_name}"
+
     except TelegramError as e:
         if "Stickerset_invalid" in str(e):
-            # Create new pack if it doesn't exist
+            # 2. Pack doesn't exist, create it
             try:
                 await bot.create_new_sticker_set(
                     user_id=user_id,
                     name=pack_name,
                     title=pack_title,
-                    stickers=[InputSticker(sticker=sticker_file, format="video", emoji_list=[emoji])],
+                    stickers=[InputSticker(sticker=sticker_file, format="video", emoji_list=["💿"])],
                     sticker_format="video"
                 )
-                return f"🎉 New pack created!\n🔗 t.me/addstickers/{pack_name}"
-            except Exception as x:
-                return f"❌ Creation failed: {x}"
+                return f"🎉 New pack created!\n\n🔗 t.me/addstickers/{pack_name}"
+            except Exception as create_error:
+                return f"❌ Failed to create pack: {create_error}"
         elif "Stickers_too_much" in str(e):
-            return "❌ Pack is full (120 stickers)."
+            return "❌ Pack is full (120 stickers). Delete some or ask dev for a new pack feature."
         else:
-            return f"❌ Error: {e}"
+            return f"❌ Telegram Error: {e}"
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.message
     
-    # 1. Get the Emoji from caption (or default to 🎬)
-    # If user types "😂" as caption, we use that. If empty, we use "🎬"
-    user_emoji = msg.caption if msg.caption else "🎬"
-
-    # Identify file
     file_id = None
     if msg.animation: file_id = msg.animation.file_id
     elif msg.video: file_id = msg.video.file_id
@@ -146,27 +159,34 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await new_file.download_to_drive(input_f)
 
-        # 2. Convert (Smart Resize)
         if await convert_to_webm(input_f, output_f):
-            await status.edit_text(f"✨ Adding to pack with emoji {user_emoji}...")
+            await status.edit_text("✨ Adding to sticker pack...")
             
-            # 3. Add to Pack (Automatic!)
-            result = await add_to_pack(user.id, output_f, user_emoji, context)
-            await status.edit_text(result)
+            # Call the new function to add directly to pack
+            result_text = await add_to_pack(user.id, output_f, context)
+            
+            await status.edit_text(result_text)
+            
+            # Optional: Send the file anyway just in case
+            # await msg.reply_document(open(output_f, 'rb'), filename="sticker.webm")
+            
         else:
-            await status.edit_text("❌ Processing failed.")
+            await status.edit_text("❌ Failed. Video might be too complex.")
             
     except Exception as e:
-        await status.edit_text(f"❌ Error: {e}")
+        print(e)
+        await status.edit_text("❌ Error occurred.")
     finally:
         if os.path.exists(input_f): os.remove(input_f)
         if os.path.exists(output_f): os.remove(output_f)
 
 if __name__ == '__main__':
     Thread(target=run_http_server).start()
+    
     if not BOT_TOKEN:
-        print("Error: BOT_TOKEN missing")
+        print("Error: BOT_TOKEN is missing!")
     else:
         app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
         app_bot.add_handler(MessageHandler(filters.ANIMATION | filters.VIDEO | filters.Document.VIDEO, handle_document))
+        print("Bot started...")
         app_bot.run_polling()
